@@ -120,7 +120,7 @@ def check_torch_dtype(*tensors):
     )  # , 'Data type could not be inferred from any item in list')
     return dtype
 
-    
+
 def add_missing_trt_tensors(network, tensors):
     """Creates missing TensorRT tensors as constants and attaches them to the Torch Tensors"""
     trt_tensors = [None] * len(tensors)
@@ -143,7 +143,7 @@ def add_missing_trt_tensors(network, tensors):
 
         # or... add constant for leaf tensor w/o _trt
         else:
-            
+
             # remove all preceding ones, these can be re-inserted later when broadcasting
             num_preceding_ones = 0
             for j in range(len(t.shape)):
@@ -152,25 +152,24 @@ def add_missing_trt_tensors(network, tensors):
                 else:
                     break
             shape = tuple(t.shape[num_preceding_ones:])
-            
+
             weight = t.detach().cpu().numpy()
             t._trt = network.add_constant(shape, weight).get_output(0)
             trt_tensor = t._trt
-
 
         assert trt_tensor is not None
 
         trt_tensors[i] = trt_tensor
 
     return trt_tensors
-    
+
 
 def broadcast_trt_tensors(network, trt_tensors, broadcast_ndim):
     """Broadcast TensorRT tensors to the specified dimension by pre-padding shape 1 dims"""
     broadcasted_trt_tensors = [None] * len(trt_tensors)
-    
+
     for i, t in enumerate(trt_tensors):
-        
+
         if len(t.shape) < broadcast_ndim:
             # append 1 size dims to front
             diff = broadcast_ndim - len(t.shape)
@@ -182,10 +181,10 @@ def broadcast_trt_tensors(network, trt_tensors, broadcast_ndim):
             trt_tensor = t
 
         broadcasted_trt_tensors[i] = trt_tensor
-        
+
     return broadcasted_trt_tensors
-    
-    
+
+
 def trt_(network, *tensors):
     """Creates missing TensorRT tensors and adds shuffle layers to make tensors broadcastable"""
     trt_tensors = [None] * len(tensors)
@@ -217,7 +216,8 @@ def trt_(network, *tensors):
         # or... add constant for leaf tensor w/o _trt
         elif isinstance(t, torch.Tensor) and not hasattr(t, "_trt"):
             # add leaf tensor
-            shape = tuple(t.shape)  #  don't exclude batch when adding constants...?
+            # don't exclude batch when adding constants...?
+            shape = tuple(t.shape)
             weight = t.detach().cpu().numpy()
             t._trt = network.add_constant(shape, weight).get_output(0)
             trt_tensor = t._trt
@@ -285,7 +285,6 @@ def attach_converter(ctx, method, converter, method_str):
             ctx.method_return = outputs
             ctx.method_str = method_str
 
-            #             print('%s' % (converter.__name__,))
             converter["converter"](ctx)
 
             # convert to None so conversion will fail for unsupported layers
@@ -321,11 +320,37 @@ class ConversionHook(object):
     def __exit__(self, type, val, tb):
         self._set_method(self.converter['method_impl'])
 
+
+class NetworkIOMetadata(object):
+    def __init__(self, original_index, type_=torch.Tensor, original_name=None):
+        self.original_index = original_index
+        self.type = type_
+        self.original_name = original_name
+
+
+def string_to_metadata(names):
+    return {name: NetworkIOMetadata(i, original_name=name) for i, name in enumerate(names)}
+
+
 def default_input_names(num_inputs):
     return ["input_%d" % i for i in range(num_inputs)]
 
-def default_output_names(num_outputs):
-    return ["output_%d" % i for i in range(num_outputs)]
+
+def default_output_names(outputs):
+    names = {}
+
+    idx = 0
+    for output_idx, output in enumerate(outputs):
+        if isinstance(output, dict):
+            for key in output.keys():
+                names['output_%d' % idx] = NetworkIOMetadata(
+                    output_idx, type_=dict, original_name=key)
+                idx += 1
+        else:
+            names['output_%d' % idx] = NetworkIOMetadata(output_idx)
+            idx += 1
+
+    return names
 
 
 class LayerNamingNetworkWrapper(object):
@@ -342,7 +367,8 @@ class LayerNamingNetworkWrapper(object):
 
         self._layer_counts[layer.type.name] += 1
         args = [arg_str(arg) for arg in self._ctx.method_args]
-        kwargs = ["%s=%s" % (key, arg_str(arg)) for key, arg in self._ctx.method_kwargs.items()]
+        kwargs = ["%s=%s" % (key, arg_str(arg))
+                  for key, arg in self._ctx.method_kwargs.items()]
         layer.name = "[%s #%d] %s(%s)" % (layer.type.name, self._layer_counts[layer.type.name],
                                           self._ctx.method_str, ", ".join(args + kwargs))
 
@@ -361,7 +387,7 @@ class LayerNamingNetworkWrapper(object):
 
 
 class ConversionContext(object):
-    
+
     def __init__(self, network, converters=CONVERTERS, torch2trt_kwargs=None):
         self.network = LayerNamingNetworkWrapper(self, network)
         self.lock = False
@@ -399,16 +425,25 @@ class ConversionContext(object):
                 torch_input._trt = trt_tensor
 
     def mark_outputs(self, torch_outputs, names=None):
-        if names is None:
-            names = default_output_names(len(torch_outputs))
-        self.output_names = names
+        self.output_names = names if names is not None else list(
+            default_output_names(torch_outputs).keys())
 
-        for i, torch_output in enumerate(torch_outputs):
-            trt_tensor = torch_output._trt
-            trt_tensor.name = names[i]
-            trt_tensor.location = torch_device_to_trt(torch_output.device)
-            trt_tensor.dtype = torch_dtype_to_trt(torch_output.dtype)
-            self.network.mark_output(trt_tensor)
+        idx = 0
+        for torch_output in torch_outputs:
+            if isinstance(torch_output, dict):
+                for tensor in torch_output.values():
+                    self.mark_output(tensor, self.output_names[idx])
+                    idx += 1
+            else:
+                self.mark_output(torch_output, self.output_names[idx])
+                idx += 1
+
+    def mark_output(self, torch_output, name):
+        trt_torch_output = torch_output._trt
+        trt_torch_output.name = name
+        trt_torch_output.location = torch_device_to_trt(torch_output.device)
+        trt_torch_output.dtype = torch_dtype_to_trt(torch_output.dtype)
+        self.network.mark_output(trt_torch_output)
 
 
 class TRTModule(torch.nn.Module):
@@ -451,14 +486,25 @@ class TRTModule(torch.nn.Module):
 
         # create output tensors
         outputs = [None] * len(self.output_names)
-        for i, output_name in enumerate(self.output_names):
+
+        for i, (output_name, metadata) in enumerate(self.output_names.items()):
             idx = self.engine.get_binding_index(output_name)
             dtype = torch_dtype_from_trt(self.engine.get_binding_dtype(idx))
             shape = (batch_size,) + tuple(self.engine.get_binding_shape(idx))
             device = torch_device_from_trt(self.engine.get_location(idx))
             output = torch.empty(size=shape, dtype=dtype, device=device)
-            outputs[i] = output
             bindings[idx] = output.data_ptr()
+
+            if metadata.type is dict:
+                if outputs[metadata.original_index] is None:
+                    outputs[metadata.original_index] = {}
+                outputs[metadata.original_index][metadata.original_name] = output
+            else:
+                outputs[metadata.original_index] = output
+
+        # Remove unused elements that were allocated previously as a result of unflattening;
+        # the original output type was a nested tensor.
+        outputs = [output for output in outputs if output is not None]
 
         for i, input_name in enumerate(self.input_names):
             idx = self.engine.get_binding_index(input_name)
@@ -469,7 +515,7 @@ class TRTModule(torch.nn.Module):
         )
 
         outputs = tuple(outputs)
-        if len(outputs) == 1:
+        if len(outputs) == 1 and isinstance(outputs[-1], torch.Tensor):
             outputs = outputs[0]
 
         return outputs
@@ -478,24 +524,24 @@ class TRTModule(torch.nn.Module):
         if not self.context.profiler:
             self.context.profiler = trt.Profiler()
 
-    
-def torch2trt(module, 
-              inputs, 
-              input_names=None, 
-              output_names=None, 
-              log_level=trt.Logger.ERROR, 
+
+def torch2trt(module,
+              inputs,
+              input_names=None,
+              output_names=None,
+              log_level=trt.Logger.ERROR,
               max_batch_size=1,
-              fp16_mode=False, 
-              max_workspace_size=1<<25, 
-              strict_type_constraints=False, 
-              keep_network=True, 
-              int8_mode=False, 
+              fp16_mode=False,
+              max_workspace_size=1 << 25,
+              strict_type_constraints=False,
+              keep_network=True,
+              int8_mode=False,
               int8_calib_dataset=None,
               int8_calib_algorithm=DEFAULT_CALIBRATION_ALGORITHM,
               int8_calib_batch_size=1,
               use_onnx=False,
               **kwargs):
-    
+
     # capture arguments to provide to context
     kwargs.update(locals())
     kwargs.pop('kwargs')
@@ -503,36 +549,43 @@ def torch2trt(module,
     inputs_in = inputs
 
     # copy inputs to avoid modifications to source data
-    inputs = [tensor.clone()[0:1] for tensor in inputs]  # only run single entry
+    inputs = [tensor.clone()[0:1]
+              for tensor in inputs]  # only run single entry
 
     logger = trt.Logger(log_level)
     builder = trt.Builder(logger)
-    
+
     if isinstance(inputs, list):
         inputs = tuple(inputs)
     if not isinstance(inputs, tuple):
         inputs = (inputs,)
-        
+
     # run once to get num outputs
     outputs = module(*inputs)
     if not isinstance(outputs, tuple) and not isinstance(outputs, list):
         outputs = (outputs,)
-        
+
     if input_names is None:
         input_names = default_input_names(len(inputs))
     if output_names is None:
-        output_names = default_output_names(len(outputs))
-        
+        # Generate output names from network outputs if no output names are given.
+        output_names = default_output_names(outputs)
+    else:
+        # Convert given output names to metadata for better consumption downstream.
+        output_names = string_to_metadata(output_names)
+
     if use_onnx:
-            
+
         f = io.BytesIO()
-        torch.onnx.export(module, inputs, f, input_names=input_names, output_names=output_names)
+        torch.onnx.export(module, inputs, f,
+                          input_names=input_names, output_names=list(output_names.keys()))
         f.seek(0)
         onnx_bytes = f.read()
-        network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+        network = builder.create_network(
+            1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
         parser = trt.OnnxParser(network, logger)
         parser.parse(onnx_bytes)
-        
+
     else:
         network = builder.create_network()
         with ConversionContext(network, torch2trt_kwargs=kwargs) as ctx:
@@ -543,7 +596,7 @@ def torch2trt(module,
 
             if not isinstance(outputs, tuple) and not isinstance(outputs, list):
                 outputs = (outputs,)
-            ctx.mark_outputs(outputs, output_names)
+            ctx.mark_outputs(outputs, list(output_names.keys()))
 
     builder.max_workspace_size = max_workspace_size
     builder.fp16_mode = fp16_mode
@@ -577,7 +630,7 @@ def torch2trt(module,
 
 def get_module_qualname(name):
     s = name.split('.')
-    
+
     for i in range(len(s)):
         idx = len(s) - i - 1
         modulename, qualname = ".".join(s[:idx]), ".".join(s[idx:])
@@ -586,26 +639,27 @@ def get_module_qualname(name):
             return module, modulename, qualname
         except:
             pass
-        
+
     raise RuntimeError("Could not import module")
-    
+
 
 def tensorrt_converter(method, is_real=True, enabled=True, imports=[]):
-    
+
     if isinstance(method, str):
         module, module_name, qual_name = get_module_qualname(method)
     else:
-        module, module_name, qual_name = importlib.import_module(method.__module__), method.__module__, method.__qualname__
-        
+        module, module_name, qual_name = importlib.import_module(
+            method.__module__), method.__module__, method.__qualname__
+
     try:
         method_impl = eval('copy.deepcopy(module.%s)' % qual_name)
     except:
         enabled = False
-    
+
     def register_converter(converter):
         CONVERTERS[method] = {
-            "converter": converter, 
-            "is_real": is_real, 
+            "converter": converter,
+            "is_real": is_real,
             "module": module,
             "module_name": module_name,
             "qual_name": qual_name,
